@@ -1,0 +1,247 @@
+port os
+import time
+import socket
+import re
+import csv
+from concurrent.futures import ThreadPoolExecutor
+
+
+def parse_ip_file(file_path):
+    """解析IP文件，返回IP和端口的列表"""
+    ip_port_list = []
+
+    try:
+        with open(file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+
+            # 使用正则表达式处理各种分隔符情况
+            match = re.match(r'^(\d+\.\d+\.\d+\.\d+)\s*[\s,:]\s*(\d+)$', line)
+
+            if match:
+                ip = match.group(1)
+                port = match.group(2)
+            else:
+                # 如果没有匹配到端口，则假设只有IP地址
+                ip_match = re.match(r'^(\d+\.\d+\.\d+\.\d+)$', line)
+                if ip_match:
+                    ip = ip_match.group(1)
+                    port = '80'  # 默认端口
+                else:
+                    print(f"警告: 无效的IP格式 '{line}'")
+                    continue
+
+            try:
+                port = int(port)
+                ip_port_list.append((ip, port))
+            except ValueError:
+                print(f"警告: 无效的端口号 '{port}' 对于IP '{ip}'")
+
+    except Exception as e:
+        print(f"读取IP文件时出错: {e}")
+
+    return ip_port_list
+
+
+def test_connection(ip, port, timeout=3):
+    """测试TCP连接"""
+    try:
+        start_time = time.time()
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+        connection_time = time.time() - start_time
+        sock.close()
+        return True, connection_time
+    except Exception as e:
+        return False, str(e)
+
+
+def test_data_transfer(ip, port, data_size=10240, timeout=5):
+    """测试数据传输速度"""
+    try:
+        # 创建socket连接
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        sock.connect((ip, port))
+
+        # 准备测试数据
+        test_data = b'X' * data_size
+
+        # 测量发送时间
+        start_time = time.time()
+        sock.sendall(test_data)
+        end_time = time.time()
+
+        # 计算速度
+        transfer_time = end_time - start_time
+        speed = (data_size / 1024) / transfer_time if transfer_time > 0 else 0
+
+        sock.close()
+        return True, speed
+    except Exception as e:
+        return False, str(e)
+
+
+def test_multiple_transfers(ip, port, data_sizes=[1024, 5120, 10240], timeout=5):
+    """多次测试传输速度取平均值"""
+    total_speed = 0
+    success_count = 0
+
+    for size in data_sizes:
+        success, result = test_data_transfer(ip, port, size, timeout)
+        if success:
+            total_speed += result
+            success_count += 1
+
+    if success_count > 0:
+        return True, total_speed / success_count
+    else:
+        return False, "所有传输测试失败"
+
+
+def test_ip_speed(ip, port):
+    """综合测试IP速度"""
+    result = {
+        'ip': ip,
+        'port': port,
+        'connection_status': False,
+        'connection_time': None,
+        'transfer_status': False,
+        'speed': 0,
+        'error': None
+    }
+
+    # 测试连接
+    conn_success, conn_result = test_connection(ip, port)
+    result['connection_status'] = conn_success
+
+    if conn_success:
+        result['connection_time'] = conn_result
+
+        # 测试传输速度
+        transfer_success, transfer_result = test_multiple_transfers(ip, port)
+        result['transfer_status'] = transfer_success
+
+        if transfer_success:
+            result['speed'] = transfer_result
+        else:
+            result['error'] = f"传输测试失败: {transfer_result}"
+    else:
+        result['error'] = f"连接失败: {conn_result}"
+
+    return result
+
+
+def main():
+    # 获取当前脚本所在目录
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    ip_file_path = os.path.join(script_dir, 'ip.txt')
+
+    # 检查ip.txt文件是否存在
+    if not os.path.isfile(ip_file_path):
+        print(f"错误: IP文件 '{ip_file_path}' 不存在")
+        return
+
+    # 解析IP文件
+    ip_port_list = parse_ip_file(ip_file_path)
+
+    if not ip_port_list:
+        print("没有找到有效的IP地址")
+        return
+
+    print(f"从文件中读取了 {len(ip_port_list)} 个IP地址")
+    print("开始测速...")
+
+    # 使用线程池并行测试IP速度
+    results = []
+    with ThreadPoolExecutor(max_workers=min(10, len(ip_port_list))) as executor:
+        future_to_ip = {executor.submit(test_ip_speed, ip, port): (ip, port) for ip, port in ip_port_list}
+        for future in future_to_ip:
+            try:
+                result = future.result()
+                results.append(result)
+
+                # 实时显示测试结果
+                if result['connection_status'] and result['transfer_status']:
+                    print(
+                        f"IP: {result['ip']}:{result['port']} - 连接时间: {result['connection_time']:.3f}秒 - 速度: {result['speed']:.2f} KB/s")
+                elif result['connection_status']:
+                    print(f"IP: {result['ip']}:{result['port']} - 连接成功 - 传输测试失败")
+                else:
+                    print(f"IP: {result['ip']}:{result['port']} - 连接失败")
+
+            except Exception as e:
+                ip, port = future_to_ip[future]
+                print(f"IP: {ip}:{port} - 测试错误: {e}")
+
+    # 过滤成功的结果
+    success_results = [r for r in results if r['connection_status'] and r['transfer_status']]
+
+    if success_results:
+        # 按速度排序
+        sorted_results = sorted(success_results, key=lambda x: x['speed'], reverse=True)
+
+        print("\n速度测试结果摘要 (按速度排序):")
+        print("-" * 60)
+        print(f"{'IP:端口':<20} {'连接时间(秒)':<15} {'速度(KB/s)':<15}")
+        print("-" * 60)
+
+        for result in sorted_results:
+            print(f"{result['ip']}:{result['port']:<15} {result['connection_time']:<15.3f} {result['speed']:<15.2f}")
+
+        print("-" * 60)
+        print(f"最快的IP: {sorted_results[0]['ip']}:{sorted_results[0]['port']} - "
+              f"速度: {sorted_results[0]['speed']:.2f} KB/s")
+
+        # 将结果输出到CSV文件
+        output_file = os.path.join(script_dir, 'ip_speed_results.csv')
+        with open(output_file, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # 写入表头
+            writer.writerow(['IP', '端口', '连接时间(秒)', '速度(KB/s)'])
+            # 写入数据
+            for result in sorted_results:
+                writer.writerow([
+                    result['ip'],
+                    result['port'],
+                    f"{result['connection_time']:.3f}",
+                    f"{result['speed']:.2f}"
+                ])
+
+        print(f"\n完整测试结果已保存至: {output_file}")
+
+        # 只输出最快的10个IP到一个单独的文件
+        if len(sorted_results) > 1:
+            top_file = os.path.join(script_dir, 'fastest_ips.txt')
+            with open(top_file, 'w', encoding='utf-8') as f:
+                for result in sorted_results[:10]:  # 取前10个
+                    f.write(f"{result['ip']}:{result['port']}\n")
+
+            print(f"前10个最快的IP已保存至: {top_file}")
+    else:
+        print("\n没有成功的速度测试结果")
+
+        # 输出部分成功的结果（只连接成功但传输失败的）
+        connection_only = [r for r in results if r['connection_status'] and not r['transfer_status']]
+        if connection_only:
+            sorted_conn = sorted(connection_only, key=lambda x: x['connection_time'])
+
+            print("\n仅连接成功的IP (按连接时间排序):")
+            print("-" * 50)
+
+            conn_file = os.path.join(script_dir, 'connected_ips.txt')
+            with open(conn_file, 'w', encoding='utf-8') as f:
+                for result in sorted_conn:
+                    print(f"{result['ip']}:{result['port']} - 连接时间: {result['connection_time']:.3f}秒")
+                    f.write(f"{result['ip']}:{result['port']}\n")
+
+            print(f"\n可连接的IP列表已保存至: {conn_file}")
+
+
+if __name__ == "__main__":
+    main()
