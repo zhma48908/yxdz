@@ -6,6 +6,7 @@ import re
 import os
 from datetime import datetime
 from typing import Optional, Dict, List, IO
+import pandas as pd
 
 def generate_vless_config(ip: str, port: int, domain: str) -> Dict:
     """生成临时的 VLESS 配置，使用 ws+tls 协议"""
@@ -208,14 +209,16 @@ async def test_ip_port(ip_port: str, domain: str, test_count: int = 3, speed_tes
 
     average_latency = mean(latencies) if latencies else -1.0
     jitter = stdev(latencies) if len(latencies) > 1 else 0.0
-    average_speed = mean(speeds) if speeds else 0.0
+    average_speed_mbps = mean(speeds) if speeds else 0.0
+    average_speed_mbs = average_speed_mbps / 8  # 转换为 MB/s
 
     return {
         "ip": ip,
         "port": port,
         "average_latency": average_latency,
         "jitter": jitter,
-        "average_speed_mbps": average_speed
+        "average_speed_mbps": average_speed_mbps,
+        "average_speed_mbs": average_speed_mbs  # 新增 MB/s 字段
     }
 
 def parse_ip_port_file(filename: str) -> List[str]:
@@ -270,20 +273,25 @@ async def main():
         print("没有有效的测试结果。")
         return
 
-    # 找到延迟最低和速度最快的 IP/端口
-    best_latency = min(valid_results, key=lambda x: x["average_latency"] if x["average_latency"] >= 0 else float('inf'))
-    best_speed = max(valid_results, key=lambda x: x["average_speed_mbps"] if x["average_speed_mbps"] > 0 else float('-inf'))
+    # 按照下载速度（MB/s）从大到小排序
+    sorted_results = sorted(valid_results, key=lambda x: x["average_speed_mbs"], reverse=True)
 
     # 输出所有结果
-    print("\n所有测试结果：")
-    for result in valid_results:
+    print("\n所有测试结果（按下载速度 MB/s 排序）：")
+    for result in sorted_results:
         print(f"IP: {result['ip']}:{result['port']}")
         latency_str = f"{result['average_latency']:.2f} ms" if result['average_latency'] >= 0 else "无法测试"
         jitter_str = f"{result['jitter']:.2f} ms" if result['jitter'] > 0 else "无法计算"
-        speed_str = f"{result['average_speed_mbps']:.2f} Mbps" if result['average_speed_mbps'] > 0 else "无法测试"
+        speed_mbps_str = f"{result['average_speed_mbps']:.2f} Mbps" if result['average_speed_mbps'] > 0 else "无法测试"
+        speed_mbs_str = f"{result['average_speed_mbs']:.2f} MB/s" if result['average_speed_mbs'] > 0 else "无法测试"
         print(f"  平均延迟: {latency_str}")
         print(f"  抖动: {jitter_str}")
-        print(f"  平均速度: {speed_str}\n")
+        print(f"  平均速度: {speed_mbps_str}")
+        print(f"  平均速度（MB/s）: {speed_mbs_str}\n")
+
+    # 找到延迟最低和速度最快的 IP/端口
+    best_latency = min(valid_results, key=lambda x: x["average_latency"] if x["average_latency"] >= 0 else float('inf'))
+    best_speed = max(valid_results, key=lambda x: x["average_speed_mbs"] if x["average_speed_mbs"] > 0 else float('-inf'))
 
     # 输出最优结果
     print("最优结果：")
@@ -292,23 +300,36 @@ async def main():
         print(f"  平均延迟: {best_latency['average_latency']:.2f} ms")
         print(f"  抖动: {best_latency['jitter']:.2f} ms")
         print(f"  平均速度: {best_latency['average_speed_mbps']:.2f} Mbps" if best_latency['average_speed_mbps'] > 0 else "无法测试")
+        print(f"  平均速度（MB/s）: {best_latency['average_speed_mbs']:.2f} MB/s" if best_latency['average_speed_mbs'] > 0 else "无法测试")
     else:
         print("未找到延迟可测的 IP/端口。")
 
-    if best_speed["average_speed_mbps"] > 0:
+    if best_speed["average_speed_mbs"] > 0:
         print(f"速度最快的 IP/端口: {best_speed['ip']}:{best_speed['port']}")
         print(f"  平均延迟: {best_speed['average_latency']:.2f} ms" if best_speed['average_latency'] >= 0 else "无法测试")
         print(f"  抖动: {best_speed['jitter']:.2f} ms" if best_speed['jitter'] > 0 else "无法计算")
         print(f"  平均速度: {best_speed['average_speed_mbps']:.2f} Mbps")
+        print(f"  平均速度（MB/s）: {best_speed['average_speed_mbs']:.2f} MB/s")
     else:
         print("未找到速度可测的 IP/端口。")
 
-    # 保存结果到 JSON 文件
+    # 保存结果到 Excel 文件
+    df = pd.DataFrame([
+        {
+            "IP": f"{result['ip']}:{result['port']}",
+            "平均延迟 (ms)": result['average_latency'] if result['average_latency'] >= 0 else "无法测试",
+            "抖动 (ms)": result['jitter'] if result['jitter'] > 0 else "无法计算",
+            "平均速度 (Mbps)": result['average_speed_mbps'] if result['average_speed_mbps'] > 0 else "无法测试",
+            "平均速度 (MB/s)": result['average_speed_mbs'] if result['average_speed_mbs'] > 0 else "无法测试"
+        }
+        for result in sorted_results
+    ])
+    df.to_excel("speed_test_results.xlsx", index=False, engine="openpyxl")
+    print("\n结果已保存到 speed_test_results.xlsx")
+
+    # 保存原始 JSON 结果
     with open("speed_test_results.json", "w", encoding="utf-8") as f:  # type: IO[str]
         json.dump(valid_results, f, indent=4, ensure_ascii=False)
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-if __name__ == "__main__":
-    main()
