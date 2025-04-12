@@ -1,247 +1,314 @@
-port os
-import time
-import socket
+import asyncio
+import subprocess
+import json
+from statistics import mean, stdev
 import re
-import csv
-from concurrent.futures import ThreadPoolExecutor
+import os
+from datetime import datetime
+from typing import Optional, Dict, List, IO
 
+def generate_vless_config(ip: str, port: int, domain: str) -> Dict:
+    """生成临时的 VLESS 配置，使用 ws+tls 协议"""
+    # 注意：'vless' 和 'geosite' 是 Xray 的专有关键字，非拼写错误
+    config = {
+        "log": {"loglevel": "debug"},  # 启用调试日志
+        "inbounds": [{
+            "port": 10808,  # 本地 SOCKS 端口
+            "protocol": "socks",
+            "settings": {"udp": True}
+        }],
+        "outbounds": [{
+            "protocol": "vless",
+            "settings": {
+                "vnext": [{
+                    "address": ip,
+                    "port": port,
+                    "users": [{
+                        "id": "202a5840-e403-4a72-8ca5-ee2d4b411322",  # 替换为实际的 UUID
+                        "encryption": "none"
+                    }]
+                }]
+            },
+            "streamSettings": {
+                "network": "ws",
+                "security": "tls",
+                "wsSettings": {
+                    "path": "/vless",  # 根据实际节点配置调整
+                    "headers": {
+                        "Host": domain
+                    }
+                },
+                "tlsSettings": {
+                    "serverName": domain,
+                    "allowInsecure": False
+                }
+            }
+        }],
+        "routing": {
+            "rules": [{
+                "type": "field",
+                "outboundTag": "direct",
+                "domain": ["geosite:cn"]
+            }]
+        }
+    }
+    return config
 
-def parse_ip_file(file_path):
-    """解析IP文件，返回IP和端口的列表"""
-    ip_port_list = []
+async def measure_latency(ip: str, port: int, domain: str, timeout: int = 5) -> float:
+    """通过 VLESS 测量延迟"""
+    config = generate_vless_config(ip, port, domain)
+    config_file = "temp_config.json"
+    process: Optional[asyncio.subprocess.Process] = None
 
     try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            lines = f.readlines()
+        with open(config_file, "w", encoding="utf-8") as f:  # type: IO[str]
+            json.dump(config, f, indent=4)
 
-        for line in lines:
-            line = line.strip()
-            if not line:
+        # 启动 Xray 进程，捕获日志
+        process = await asyncio.create_subprocess_exec(
+            "xray", "-c", config_file,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE
+        )
+
+        # 等待 Xray 启动
+        await asyncio.sleep(1)
+
+        # 使用 curl 通过本地 SOCKS 代理测试延迟
+        # 注意：'steamstatic' 是域名的一部分，非拼写错误
+        url = f"https://{domain}/steam/apps/256870924/movie_max.mp4"
+        start_time = datetime.now()
+        result = subprocess.run([
+            "curl", "-x", "socks5://127.0.0.1:10808", "-I", "--max-time", str(timeout),
+            "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
+            "-H", "Accept: */*",
+            url
+        ], capture_output=True, text=True)
+        end_time = datetime.now()
+
+        latency = (end_time - start_time).microseconds / 1000  # 转换为 ms
+        if result.returncode != 0:
+            print(f"延迟测试失败 {ip}:{port}: {result.stderr or '无错误输出'}")
+            return -1.0
+
+        return latency
+
+    except asyncio.CancelledError:
+        print(f"延迟测试被取消 {ip}:{port}")
+        return -1.0
+    except Exception as e:
+        print(f"延迟测试失败 {ip}:{port}: {e}")
+        return -1.0
+    finally:
+        if os.path.exists(config_file):
+            os.remove(config_file)
+        if process is not None and process.returncode is None:
+            process.terminate()
+            stdout, stderr = await process.communicate()
+            if stderr:
+                print(f"Xray 延迟测试错误输出 {ip}:{port}: {stderr.decode()}")
+
+async def measure_speed(ip: str, port: int, domain: str, timeout: int = 30, max_retries: int = 3) -> float:
+    """通过 VLESS 测量下载速度"""
+    config = generate_vless_config(ip, port, domain)
+    config_file = "temp_config.json"
+    process: Optional[asyncio.subprocess.Process] = None
+
+    for attempt in range(max_retries):
+        try:
+            with open(config_file, "w", encoding="utf-8") as f:  # type: IO[str]
+                json.dump(config, f, indent=4)
+
+            # 启动 Xray 进程，捕获日志
+            process = await asyncio.create_subprocess_exec(
+                "xray", "-c", config_file,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+
+            # 等待 Xray 启动
+            await asyncio.sleep(1)
+
+            # 使用 curl 通过本地 SOCKS 代理下载部分数据，限制大小
+            url = f"https://{domain}/steam/apps/256870924/movie_max.mp4"
+            temp_file = "temp_download.bin"
+            start_time = datetime.now()
+            result = subprocess.run([
+                "curl", "-x", "socks5://127.0.0.1:10808", "-s", "--max-time", str(timeout),
+                "-H", "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124",
+                "-H", "Accept: */*",
+                "--range", "0-1048576",  # 限制下载 1MB
+                "-o", temp_file, url
+            ], capture_output=True, text=True)
+            end_time = datetime.now()
+
+            time_taken = (end_time - start_time).total_seconds()
+            if result.returncode != 0:
+                print(f"速度测试尝试 {attempt + 1}/{max_retries} 失败 {ip}:{port}: {result.stderr or '无错误输出'}")
                 continue
 
-            # 使用正则表达式处理各种分隔符情况
-            match = re.match(r'^(\d+\.\d+\.\d+\.\d+)\s*[\s,:]\s*(\d+)$', line)
+            # 检查实际下载的文件大小
+            downloaded_size = os.path.getsize(temp_file) / 1024 / 1024  # 转换为 MB
+            os.remove(temp_file)
 
-            if match:
-                ip = match.group(1)
-                port = match.group(2)
-            else:
-                # 如果没有匹配到端口，则假设只有IP地址
-                ip_match = re.match(r'^(\d+\.\d+\.\d+\.\d+)$', line)
-                if ip_match:
-                    ip = ip_match.group(1)
-                    port = '80'  # 默认端口
-                else:
-                    print(f"警告: 无效的IP格式 '{line}'")
-                    continue
+            if downloaded_size > 0 and time_taken > 0:
+                speed_mbps = (downloaded_size / time_taken) * 8  # 转换为 Mbps
+                print(f"速度测试成功 {ip}:{port}: 下载 {downloaded_size:.2f} MB, 时间 {time_taken:.2f} s, 速度 {speed_mbps:.2f} Mbps")
+                return speed_mbps
+            print(f"速度测试失败 {ip}:{port}: 未下载数据或时间过短")
+            return 0.0
 
-            try:
-                port = int(port)
-                ip_port_list.append((ip, port))
-            except ValueError:
-                print(f"警告: 无效的端口号 '{port}' 对于IP '{ip}'")
+        except asyncio.CancelledError:
+            print(f"速度测试被取消 {ip}:{port}")
+            return 0.0
+        except Exception as e:
+            print(f"速度测试尝试 {attempt + 1}/{max_retries} 失败 {ip}:{port}: {e}")
+            continue
+        finally:
+            if os.path.exists(config_file):
+                os.remove(config_file)
+            if process is not None and process.returncode is None:
+                process.terminate()
+                stdout, stderr = await process.communicate()
+                if stderr:
+                    print(f"Xray 速度测试错误输出 {ip}:{port}: {stderr.decode()}")
 
-    except Exception as e:
-        print(f"读取IP文件时出错: {e}")
+    print(f"速度测试所有尝试失败 {ip}:{port}")
+    return 0.0
 
-    return ip_port_list
-
-
-def test_connection(ip, port, timeout=3):
-    """测试TCP连接"""
-    try:
-        start_time = time.time()
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((ip, port))
-        connection_time = time.time() - start_time
-        sock.close()
-        return True, connection_time
-    except Exception as e:
-        return False, str(e)
-
-
-def test_data_transfer(ip, port, data_size=10240, timeout=5):
-    """测试数据传输速度"""
-    try:
-        # 创建socket连接
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(timeout)
-        sock.connect((ip, port))
-
-        # 准备测试数据
-        test_data = b'X' * data_size
-
-        # 测量发送时间
-        start_time = time.time()
-        sock.sendall(test_data)
-        end_time = time.time()
-
-        # 计算速度
-        transfer_time = end_time - start_time
-        speed = (data_size / 1024) / transfer_time if transfer_time > 0 else 0
-
-        sock.close()
-        return True, speed
-    except Exception as e:
-        return False, str(e)
-
-
-def test_multiple_transfers(ip, port, data_sizes=[1024, 5120, 10240], timeout=5):
-    """多次测试传输速度取平均值"""
-    total_speed = 0
-    success_count = 0
-
-    for size in data_sizes:
-        success, result = test_data_transfer(ip, port, size, timeout)
-        if success:
-            total_speed += result
-            success_count += 1
-
-    if success_count > 0:
-        return True, total_speed / success_count
+async def test_ip_port(ip_port: str, domain: str, test_count: int = 3, speed_test_count: int = 1) -> Optional[Dict]:
+    """测试单个 IP 和端口的性能"""
+    if ":" in ip_port:
+        ip, port = ip_port.split(":", 1)
     else:
-        return False, "所有传输测试失败"
+        parts = ip_port.split()
+        if len(parts) != 2:
+            print(f"跳过无效行: {ip_port}")
+            return None
+        ip, port = parts[0], parts[1]
 
+    port = int(port)
 
-def test_ip_speed(ip, port):
-    """综合测试IP速度"""
-    result = {
-        'ip': ip,
-        'port': port,
-        'connection_status': False,
-        'connection_time': None,
-        'transfer_status': False,
-        'speed': 0,
-        'error': None
+    # 验证 IP 格式（这里假设都是 IPv4）
+    if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip):
+        print(f"跳过无效 IP 格式: {ip}")
+        return None
+
+    latencies = []
+    for _ in range(test_count):
+        latency = await measure_latency(ip, port, domain)
+        if latency >= 0:
+            latencies.append(latency)
+        await asyncio.sleep(0.1)
+
+    speeds = []
+    for _ in range(speed_test_count):
+        speed = await measure_speed(ip, port, domain)
+        if speed > 0:
+            speeds.append(speed)
+        await asyncio.sleep(0.1)
+
+    average_latency = mean(latencies) if latencies else -1.0
+    jitter = stdev(latencies) if len(latencies) > 1 else 0.0
+    average_speed = mean(speeds) if speeds else 0.0
+
+    return {
+        "ip": ip,
+        "port": port,
+        "average_latency": average_latency,
+        "jitter": jitter,
+        "average_speed_mbps": average_speed
     }
 
-    # 测试连接
-    conn_success, conn_result = test_connection(ip, port)
-    result['connection_status'] = conn_success
-
-    if conn_success:
-        result['connection_time'] = conn_result
-
-        # 测试传输速度
-        transfer_success, transfer_result = test_multiple_transfers(ip, port)
-        result['transfer_status'] = transfer_success
-
-        if transfer_success:
-            result['speed'] = transfer_result
-        else:
-            result['error'] = f"传输测试失败: {transfer_result}"
-    else:
-        result['error'] = f"连接失败: {conn_result}"
-
-    return result
-
-
-def main():
-    # 获取当前脚本所在目录
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    ip_file_path = os.path.join(script_dir, 'ip.txt')
-
-    # 检查ip.txt文件是否存在
-    if not os.path.isfile(ip_file_path):
-        print(f"错误: IP文件 '{ip_file_path}' 不存在")
-        return
-
-    # 解析IP文件
-    ip_port_list = parse_ip_file(ip_file_path)
-
-    if not ip_port_list:
-        print("没有找到有效的IP地址")
-        return
-
-    print(f"从文件中读取了 {len(ip_port_list)} 个IP地址")
-    print("开始测速...")
-
-    # 使用线程池并行测试IP速度
-    results = []
-    with ThreadPoolExecutor(max_workers=min(10, len(ip_port_list))) as executor:
-        future_to_ip = {executor.submit(test_ip_speed, ip, port): (ip, port) for ip, port in ip_port_list}
-        for future in future_to_ip:
-            try:
-                result = future.result()
-                results.append(result)
-
-                # 实时显示测试结果
-                if result['connection_status'] and result['transfer_status']:
-                    print(
-                        f"IP: {result['ip']}:{result['port']} - 连接时间: {result['connection_time']:.3f}秒 - 速度: {result['speed']:.2f} KB/s")
-                elif result['connection_status']:
-                    print(f"IP: {result['ip']}:{result['port']} - 连接成功 - 传输测试失败")
+def parse_ip_port_file(filename: str) -> List[str]:
+    """解析 ips_ports.txt 文件，支持 ':' 和空格分隔"""
+    ip_ports = []
+    try:
+        with open(filename, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):  # 跳过空行和注释
+                    continue
+                if ":" in line:
+                    ip, port = line.split(":", 1)
+                    ip_ports.append(f"{ip}:{port}")
                 else:
-                    print(f"IP: {result['ip']}:{result['port']} - 连接失败")
+                    parts = line.split()
+                    if len(parts) == 2:
+                        ip_ports.append(f"{parts[0]}:{parts[1]}")
+                    else:
+                        print(f"警告：跳过格式错误的行: {line}")
+        return ip_ports
+    except FileNotFoundError:
+        print(f"错误：找不到 {filename} 文件，请确保文件存在。")
+        return []
+    except Exception as e:
+        print(f"读取文件失败: {e}")
+        return []
 
-            except Exception as e:
-                ip, port = future_to_ip[future]
-                print(f"IP: {ip}:{port} - 测试错误: {e}")
+async def main():
+    # 配置
+    domain = "cdn.cloudflare.steamstatic.com"  # 测速域名
+    test_count = 3  # 延迟测试次数
+    speed_test_count = 1  # 速度测试次数
 
-    # 过滤成功的结果
-    success_results = [r for r in results if r['connection_status'] and r['transfer_status']]
+    # 解析 IP 和端口文件
+    ip_ports = parse_ip_port_file("ips_ports.txt")
+    if not ip_ports:
+        return
 
-    if success_results:
-        # 按速度排序
-        sorted_results = sorted(success_results, key=lambda x: x['speed'], reverse=True)
+    # 并发测试所有 IP 和端口
+    tasks = [test_ip_port(ip_port, domain, test_count, speed_test_count) for ip_port in ip_ports]
+    try:
+        results = await asyncio.gather(*[task for task in tasks if task is not None], return_exceptions=True)
+    except asyncio.CancelledError:
+        print("测试被取消")
+        return
 
-        print("\n速度测试结果摘要 (按速度排序):")
-        print("-" * 60)
-        print(f"{'IP:端口':<20} {'连接时间(秒)':<15} {'速度(KB/s)':<15}")
-        print("-" * 60)
+    # 过滤掉 None 和异常结果
+    valid_results = [r for r in results if isinstance(r, dict) and r is not None]
 
-        for result in sorted_results:
-            print(f"{result['ip']}:{result['port']:<15} {result['connection_time']:<15.3f} {result['speed']:<15.2f}")
+    if not valid_results:
+        print("没有有效的测试结果。")
+        return
 
-        print("-" * 60)
-        print(f"最快的IP: {sorted_results[0]['ip']}:{sorted_results[0]['port']} - "
-              f"速度: {sorted_results[0]['speed']:.2f} KB/s")
+    # 找到延迟最低和速度最快的 IP/端口
+    best_latency = min(valid_results, key=lambda x: x["average_latency"] if x["average_latency"] >= 0 else float('inf'))
+    best_speed = max(valid_results, key=lambda x: x["average_speed_mbps"] if x["average_speed_mbps"] > 0 else float('-inf'))
 
-        # 将结果输出到CSV文件
-        output_file = os.path.join(script_dir, 'ip_speed_results.csv')
-        with open(output_file, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.writer(f)
-            # 写入表头
-            writer.writerow(['IP', '端口', '连接时间(秒)', '速度(KB/s)'])
-            # 写入数据
-            for result in sorted_results:
-                writer.writerow([
-                    result['ip'],
-                    result['port'],
-                    f"{result['connection_time']:.3f}",
-                    f"{result['speed']:.2f}"
-                ])
+    # 输出所有结果
+    print("\n所有测试结果：")
+    for result in valid_results:
+        print(f"IP: {result['ip']}:{result['port']}")
+        latency_str = f"{result['average_latency']:.2f} ms" if result['average_latency'] >= 0 else "无法测试"
+        jitter_str = f"{result['jitter']:.2f} ms" if result['jitter'] > 0 else "无法计算"
+        speed_str = f"{result['average_speed_mbps']:.2f} Mbps" if result['average_speed_mbps'] > 0 else "无法测试"
+        print(f"  平均延迟: {latency_str}")
+        print(f"  抖动: {jitter_str}")
+        print(f"  平均速度: {speed_str}\n")
 
-        print(f"\n完整测试结果已保存至: {output_file}")
-
-        # 只输出最快的10个IP到一个单独的文件
-        if len(sorted_results) > 1:
-            top_file = os.path.join(script_dir, 'fastest_ips.txt')
-            with open(top_file, 'w', encoding='utf-8') as f:
-                for result in sorted_results[:10]:  # 取前10个
-                    f.write(f"{result['ip']}:{result['port']}\n")
-
-            print(f"前10个最快的IP已保存至: {top_file}")
+    # 输出最优结果
+    print("最优结果：")
+    if best_latency["average_latency"] >= 0:
+        print(f"延迟最低的 IP/端口: {best_latency['ip']}:{best_latency['port']}")
+        print(f"  平均延迟: {best_latency['average_latency']:.2f} ms")
+        print(f"  抖动: {best_latency['jitter']:.2f} ms")
+        print(f"  平均速度: {best_latency['average_speed_mbps']:.2f} Mbps" if best_latency['average_speed_mbps'] > 0 else "无法测试")
     else:
-        print("\n没有成功的速度测试结果")
+        print("未找到延迟可测的 IP/端口。")
 
-        # 输出部分成功的结果（只连接成功但传输失败的）
-        connection_only = [r for r in results if r['connection_status'] and not r['transfer_status']]
-        if connection_only:
-            sorted_conn = sorted(connection_only, key=lambda x: x['connection_time'])
+    if best_speed["average_speed_mbps"] > 0:
+        print(f"速度最快的 IP/端口: {best_speed['ip']}:{best_speed['port']}")
+        print(f"  平均延迟: {best_speed['average_latency']:.2f} ms" if best_speed['average_latency'] >= 0 else "无法测试")
+        print(f"  抖动: {best_speed['jitter']:.2f} ms" if best_speed['jitter'] > 0 else "无法计算")
+        print(f"  平均速度: {best_speed['average_speed_mbps']:.2f} Mbps")
+    else:
+        print("未找到速度可测的 IP/端口。")
 
-            print("\n仅连接成功的IP (按连接时间排序):")
-            print("-" * 50)
+    # 保存结果到 JSON 文件
+    with open("speed_test_results.json", "w", encoding="utf-8") as f:  # type: IO[str]
+        json.dump(valid_results, f, indent=4, ensure_ascii=False)
 
-            conn_file = os.path.join(script_dir, 'connected_ips.txt')
-            with open(conn_file, 'w', encoding='utf-8') as f:
-                for result in sorted_conn:
-                    print(f"{result['ip']}:{result['port']} - 连接时间: {result['connection_time']:.3f}秒")
-                    f.write(f"{result['ip']}:{result['port']}\n")
-
-            print(f"\n可连接的IP列表已保存至: {conn_file}")
-
+if __name__ == "__main__":
+    asyncio.run(main())
 
 if __name__ == "__main__":
     main()
