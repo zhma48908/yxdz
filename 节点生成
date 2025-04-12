@@ -1,0 +1,225 @@
+# !/usr/bin/env python3
+import json
+import os
+from datetime import datetime
+
+# 预设的参数
+UUID = "202a5840-e403-4a72-8ca5-ee2d4b411322"
+HOST = "lab.gjcw.dpdns.org"
+PROXY_IP = "ProxyIP.US.CMLiussss.net:443"
+PROTOCOL = "vless"
+
+ENCRYPTION = "none"
+SECURITY = "tls"
+NETWORK = "ws"
+
+# 固定的IP文件名
+IP_FILE = "ip.txt"
+
+
+def parse_ip_port(line):
+    """从文本行中解析 IP 地址和端口"""
+    # 处理冒号分隔的格式
+    if ':' in line:
+        ip, port = line.strip().split(':', 1)
+        return ip.strip(), port.strip()
+
+    # 处理空格分隔的格式
+    parts = line.strip().split()
+    if len(parts) >= 2:
+        return parts[0].strip(), parts[1].strip()
+
+    return None, None
+
+
+def generate_vless_link(ip, port):
+    """生成 VLESS 链接 - 针对 v2rayN V7.10 格式调整"""
+    # V2rayN 兼容的参数格式
+    params = [
+        f"type={NETWORK}",  # 注意：这里使用 type=ws 表示 WebSocket
+        f"security={SECURITY}",
+        f"host={HOST}",
+        f"path=/ws",
+        f"encryption={ENCRYPTION}",
+        f"sni={HOST}",
+        "headerType=none",
+        "fp=chrome"
+    ]
+
+    params_str = "&".join(params)
+    link = f"{PROTOCOL}://{UUID}@{ip}:{port}?{params_str}#{ip}:{port}"
+    return link
+
+
+def generate_v2ray_config(ip, port):
+    """生成 V2Ray 配置"""
+    config = {
+        "v": "2",
+        "ps": f"{ip}:{port}",
+        "add": ip,
+        "port": port,
+        "id": UUID,
+        "aid": "0",
+        "scy": ENCRYPTION,
+        "net": NETWORK,  # 确保是 ws
+        "type": "none",
+        "host": HOST,
+        "path": "/ws",
+        "tls": SECURITY,
+        "sni": HOST,
+        "alpn": ""
+    }
+    return config
+
+
+def generate_clash_config(ip, port):
+    """生成 Clash 配置"""
+    config = {
+        "name": f"{ip}:{port}",
+        "type": PROTOCOL,
+        "server": ip,
+        "port": int(port),
+        "uuid": UUID,
+        "tls": True,
+        "servername": HOST,
+        "network": NETWORK,  # 确保是 ws
+        "ws-opts": {
+            "path": "/ws",
+            "headers": {
+                "Host": HOST
+            }
+        }
+    }
+    return config
+
+
+def main():
+    print("VLESS WebSocket 配置生成器")
+    print("-------------------------")
+
+    # 检查IP文件是否存在
+    if not os.path.exists(IP_FILE):
+        print(f"错误: 文件 {IP_FILE} 不存在!")
+        print("请确保在当前目录下创建一个名为 ip.txt 的文件，包含IP地址和端口信息。")
+        input("按任意键退出...")
+        return
+
+    print(f"找到 {IP_FILE} 文件，开始处理...")
+
+    # 创建输出目录
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = f"vless_configs_{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    # 读取IP地址和端口
+    with open(IP_FILE, 'r') as f:
+        lines = f.readlines()
+
+    vless_links = []
+    v2ray_configs = []
+    clash_proxies = []
+
+    valid_count = 0
+
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+
+        ip, port = parse_ip_port(line)
+        if not ip or not port:
+            print(f"警告: 无法解析行: {line}")
+            continue
+
+        # 生成不同格式的配置
+        vless_link = generate_vless_link(ip, port)
+        vless_links.append(vless_link)
+
+        v2ray_config = generate_v2ray_config(ip, port)
+        v2ray_configs.append(v2ray_config)
+
+        clash_config = generate_clash_config(ip, port)
+        clash_proxies.append(clash_config)
+
+        valid_count += 1
+        print(f"处理 {ip}:{port} 成功")
+
+    if valid_count == 0:
+        print("未找到有效的 IP:端口 组合，请检查 ip.txt 文件格式")
+        input("按任意键退出...")
+        return
+
+    # 保存 VLESS 链接
+    with open(f"{output_dir}/vless_links.txt", 'w') as f:
+        for link in vless_links:
+            f.write(f"{link}\n")
+
+    # 保存包含链接说明的文本文件
+    with open(f"{output_dir}/readme.txt", 'w') as f:
+        f.write("VLESS WebSocket 配置说明\n")
+        f.write("=======================\n\n")
+        f.write("配置参数：\n")
+        f.write(f"- 协议：VLESS + WebSocket + TLS\n")
+        f.write(f"- UUID: {UUID}\n")
+        f.write(f"- 主机: {HOST}\n")
+        f.write(f"- 代理IP: {PROXY_IP}\n")
+        f.write(f"- 路径: /ws\n\n")
+        f.write("文件说明：\n")
+        f.write("- vless_links.txt: VLESS 链接，可直接导入 v2rayN 等客户端\n")
+        f.write("- v2ray_configs.json: V2Ray 格式的配置\n")
+        f.write("- clash_config.yaml: Clash 格式的配置\n\n")
+        f.write("生成时间: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+
+    # 保存 V2Ray 配置
+    with open(f"{output_dir}/v2ray_configs.json", 'w') as f:
+        json.dump(v2ray_configs, f, indent=2)
+
+    # 保存 Clash 配置
+    clash_config = {
+        "proxies": clash_proxies,
+        "proxy-groups": [
+            {
+                "name": "VLESS_SERVERS",
+                "type": "select",
+                "proxies": [proxy["name"] for proxy in clash_proxies]
+            }
+        ]
+    }
+    with open(f"{output_dir}/clash_config.yaml", 'w') as f:
+        f.write("# Clash 配置\n")
+        f.write("# 生成时间: " + datetime.now().strftime("%Y-%m-%d %H:%M:%S") + "\n\n")
+        f.write("proxies:\n")
+        for proxy in clash_proxies:
+            f.write(f"  - name: {proxy['name']}\n")
+            f.write(f"    type: {proxy['type']}\n")
+            f.write(f"    server: {proxy['server']}\n")
+            f.write(f"    port: {proxy['port']}\n")
+            f.write(f"    uuid: {proxy['uuid']}\n")
+            f.write(f"    tls: {str(proxy['tls']).lower()}\n")
+            f.write(f"    servername: {proxy['servername']}\n")
+            f.write(f"    network: {proxy['network']}\n")
+            f.write("    ws-opts:\n")
+            f.write(f"      path: {proxy['ws-opts']['path']}\n")
+            f.write("      headers:\n")
+            f.write(f"        Host: {proxy['ws-opts']['headers']['Host']}\n")
+            f.write("\n")
+
+        f.write("proxy-groups:\n")
+        f.write("  - name: VLESS_SERVERS\n")
+        f.write("    type: select\n")
+        f.write("    proxies:\n")
+        for proxy in clash_proxies:
+            f.write(f"      - {proxy['name']}\n")
+
+    print("\n配置已生成并保存到目录: " + output_dir)
+    print(f"- VLESS 链接: {output_dir}/vless_links.txt")
+    print(f"- V2Ray 配置: {output_dir}/v2ray_configs.json")
+    print(f"- Clash 配置: {output_dir}/clash_config.yaml")
+    print(f"- 说明文件: {output_dir}/readme.txt")
+
+    print("\n处理完成!")
+    input("按任意键退出...")
+
+
+if __name__ == "__main__":
+    main()
